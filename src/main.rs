@@ -1,15 +1,27 @@
+use clap::Parser;
 use futures::future::join_all;
 use indicatif::{ProgressBar, ProgressStyle};
 use percent_encoding::percent_decode;
 use reqwest::header::CONTENT_LENGTH;
 use reqwest::header::RANGE;
 use reqwest::Url;
-use std::io;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use tempfile::tempdir;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// URL to download
+    url: String,
+
+    /// Output directory
+    #[arg(short, long, value_name = "DIR")]
+    output: Option<PathBuf>,
+}
 
 fn extract_filename(url: &str) -> String {
     let parsed = Url::parse(url).ok();
@@ -44,12 +56,12 @@ fn extract_filename(url: &str) -> String {
         format!("{}.{}", safe_name, ext)
     }
 }
+
 #[tokio::main]
 async fn main() {
-    println!("Please input url:");
-    let mut url = String::new();
-    io::stdin().read_line(&mut url).expect("Read line failed");
-    let url = url.trim();
+    let args = Args::parse();
+
+    let url = args.url.trim();
 
     let client = reqwest::Client::new();
     let head_response = client
@@ -77,10 +89,17 @@ async fn main() {
         let chunk_size = content_length / chunk_count;
         let mut tasks = Vec::new();
         let filename = extract_filename(url);
-        println!("File will save to : {}", filename);
-        let temp_dir = tempfile::tempdir().expect("Create temp dir failed");
-        let temp_files: Vec<PathBuf> = Vec::new();
 
+        // Determine the output directory
+        let output_dir = args.output.unwrap_or_else(|| {
+            let home_dir = dirs::download_dir().expect("Failed to get download directory");
+            home_dir
+        });
+        let file_path = output_dir.join(&filename);
+
+        let temp_dir = tempdir().expect("Create temp dir failed");
+        let temp_files: Arc<Mutex<Vec<Option<PathBuf>>>> =
+            Arc::new(Mutex::new(vec![None; chunk_count as usize]));
         let pb = Arc::new(ProgressBar::new(content_length));
         pb.set_style(ProgressStyle::default_bar()
              .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
@@ -98,41 +117,76 @@ async fn main() {
             let url = url.to_string();
             let temp_path = temp_dir.path().join(format!("part{}", i));
             let pb = pb.clone();
+            let temp_files_clone = temp_files.clone(); // 克隆 Arc<Mutex>
+            let index = i as usize;
             tasks.push(tokio::spawn(async move {
-                let response = client
-                    .get(&url)
-                    .header(RANGE, format!("bytes={}-{}", start, end))
-                    .send()
-                    .await
-                    .expect("GET request failed");
-                let mut file = File::create(&temp_path)
-                    .await
-                    .expect("Create temp file failed");
-                let bytes = response.bytes().await.expect("Read bytes failed");
-                file.write_all(&bytes)
-                    .await
-                    .expect("write temp file failed");
-                pb.inc(bytes.len() as u64);
+                let mut retries = 0;
+                while retries < 3 {
+                    match download_chunk(&client, &url, start, end, &temp_path).await {
+                        Ok(bytes) => {
+                            pb.inc(bytes.len() as u64);
+                            let mut temp_files_lock = temp_files_clone.lock().unwrap();
+                            (*temp_files_lock)[index] = Some(temp_path);
+                            break;
+                        }
+                        Err(e) => {
+                            retries += 1;
+                            eprintln!(
+                                "Error downloading chunk {}: {}. Retrying ({}/3)...",
+                                i, e, retries
+                            );
+                            if retries == 3 {
+                                eprintln!("Failed to download chunk {} after 3 retries", i);
+                            }
+                        }
+                    }
+                }
             }));
         }
 
         join_all(tasks).await;
 
-        let mut file = File::create(&filename).await.expect("Create file failed");
-        for temp_path in temp_files {
-            let mut temp_file = File::open(&temp_path).await.expect("Open temp file failed");
-            let mut buffer = Vec::new();
-            temp_file
-                .read_to_end(&mut buffer)
-                .await
-                .expect("Read temp file failed");
-            file.write_all(&buffer).await.expect("Write file failed");
+        // 解锁 temp_files 并合并文件
+        let temp_files_final = temp_files.lock().unwrap();
+        let mut file = File::create(&file_path).await.expect("Create file failed");
+        for (i, temp_path) in temp_files_final.iter().enumerate() {
+            if let Some(path) = temp_path {
+                let mut temp_file = File::open(path).await.expect("Open temp file failed");
+                let mut buffer = Vec::new();
+                temp_file
+                    .read_to_end(&mut buffer)
+                    .await
+                    .expect("Read temp file failed");
+                file.write_all(&buffer).await.expect("Write file failed");
+            } else {
+                eprintln!("Skipping chunk {} as it failed to download", i);
+            }
         }
 
         temp_dir.close().expect("Remove temp dir failed");
         println!("Download complete!");
+
+        println!("File saved at: {}", file_path.display());
         pb.finish_with_message("Download complete");
     } else {
         println!("Server does not support range requests");
     }
+}
+
+async fn download_chunk(
+    client: &reqwest::Client,
+    url: &str,
+    start: u64,
+    end: u64,
+    temp_path: &Path,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let response = client
+        .get(url)
+        .header(RANGE, format!("bytes={}-{}", start, end))
+        .send()
+        .await?;
+    let bytes = response.bytes().await?;
+    let mut file = File::create(temp_path).await?;
+    file.write_all(&bytes).await?;
+    Ok(bytes.to_vec())
 }
