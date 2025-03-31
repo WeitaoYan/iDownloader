@@ -85,6 +85,13 @@ async fn main() {
         .await
         .expect("Send head request failed");
 
+    if !head_response.status().is_success() {
+        eprintln!(
+            "Failed to download: Server returned status code {}",
+            head_response.status()
+        );
+        return;
+    }
     let accept_ranges = head_response
         .headers()
         .get("accept-ranges")
