@@ -21,9 +21,25 @@ struct Args {
     /// Output directory
     #[arg(short, long, value_name = "DIR")]
     output: Option<PathBuf>,
-}
 
-fn extract_filename(url: &str) -> String {
+    /// Maximum number of chunks
+    #[arg(short, long, default_value_t = 500, value_name = "NUM")]
+    max_chunks: u64,
+}
+fn extract_filename(url: &str, headers: &reqwest::header::HeaderMap) -> String {
+    // 首先尝试从 Content-Disposition 头中获取文件名
+    if let Some(content_disposition) = headers.get("content-disposition") {
+        if let Ok(content_disposition_str) = content_disposition.to_str() {
+            if let Some(filename) = content_disposition_str
+                .split(';')
+                .find_map(|part| part.trim().strip_prefix("filename="))
+            {
+                return filename.to_string();
+            }
+        }
+    }
+
+    // 如果没有找到，再从URL路径中提取文件名
     let parsed = Url::parse(url).ok();
     let path = parsed.as_ref().and_then(|u| Some(u.path()));
 
@@ -56,7 +72,6 @@ fn extract_filename(url: &str) -> String {
         format!("{}.{}", safe_name, ext)
     }
 }
-
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
@@ -84,11 +99,11 @@ async fn main() {
         let content_length: u64 = content_length_header
             .parse()
             .expect("Invalid content length");
-        let chunk_count = 500.min(content_length);
+        let chunk_count = args.max_chunks.min(content_length as u64);
         println!("Will split into {} chunks", chunk_count);
         let chunk_size = content_length / chunk_count;
         let mut tasks = Vec::new();
-        let filename = extract_filename(url);
+        let filename = extract_filename(url, &head_response.headers());
 
         // Determine the output directory
         let output_dir = args.output.unwrap_or_else(|| {
@@ -165,9 +180,7 @@ async fn main() {
 
         temp_dir.close().expect("Remove temp dir failed");
         println!("Download complete!");
-
         println!("File saved at: {}", file_path.display());
-        pb.finish_with_message("Download complete");
     } else {
         println!("Server does not support range requests");
     }
