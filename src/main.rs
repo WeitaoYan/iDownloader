@@ -25,6 +25,10 @@ struct Args {
     /// Maximum number of chunks
     #[arg(short, long, default_value_t = 500, value_name = "NUM")]
     max_chunks: u64,
+
+    /// Maximum number of retries
+    #[arg(short = 'r', long, default_value_t = 3, value_name = "NUM")]
+    max_retries: u64, // 添加最大重试次数参数
 }
 fn extract_filename(url: &str, headers: &reqwest::header::HeaderMap) -> String {
     // 首先尝试从 Content-Disposition 头中获取文件名
@@ -141,9 +145,11 @@ async fn main() {
             let pb = pb.clone();
             let temp_files_clone = temp_files.clone(); // 克隆 Arc<Mutex>
             let index = i as usize;
+            let max_retries = args.max_retries; // 获取最大重试次数
             tasks.push(tokio::spawn(async move {
                 let mut retries = 0;
-                while retries < 3 {
+                while retries < max_retries {
+                    // 使用新参数控制重试次数
                     match download_chunk(&client, &url, start, end, &temp_path).await {
                         Ok(bytes) => {
                             pb.inc(bytes.len() as u64);
@@ -154,11 +160,14 @@ async fn main() {
                         Err(e) => {
                             retries += 1;
                             eprintln!(
-                                "Error downloading chunk {}: {}. Retrying ({}/3)...",
-                                i, e, retries
+                                "Error downloading chunk {}: {}. Retrying ({}/{})...",
+                                i, e, retries, max_retries
                             );
-                            if retries == 3 {
-                                eprintln!("Failed to download chunk {} after 3 retries", i);
+                            if retries == max_retries {
+                                eprintln!(
+                                    "Failed to download chunk {} after {} retries",
+                                    i, max_retries
+                                );
                             }
                         }
                     }
